@@ -11,10 +11,22 @@ import argparse
 import subprocess
 import configparser
 from getpass import getpass
+from urllib.parse import urlparse
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 """An icinga check_command wrapper to icinga api for submitting passive check results"""
+
+def verify_url(url):
+    """parse and verify url validity"""
+    
+    try:
+        parsed = urlparse(url)
+        if bool(parsed.scheme) and bool(parsed.netloc):
+            return parsed
+        return None
+    except Exception as e:
+        return None
 
 def parse_args():
     """Parse command line arguments, capture known and unknown args"""
@@ -43,18 +55,19 @@ def load_config(args):
         
         return config
     
-    # request api url
+    # request api url until a valid url is provided
     durl = "https://localhost:5665"
-    default["url"] = input(f"Icinga API url (default: {durl}):") or durl
-    default["url"] += "/v1/actions/process-check-result"
+    while not "url" in default or url := verify_url(default["url"]) is None:
+        if url is None:
+            print("[ERROR] Invalid url, please specify a valid url.")
+        default["url"] = input(f"Icinga API master url (default: {durl}):") or durl
+        default["url"] += "/v1/actions/process-check-result"
+    
+    # TODO: Add download certificate and validate connection
     
     # request check_source property
     hostname = socket.getfqdn()
     default["check_source"] = input(f"Input host name (default:{hostname}):") or hostname
-    
-    # FIXME: verify url validy
-    
-    # TODO: Add download certificate and validate connection
     
     # request username
     duser = "passive"
