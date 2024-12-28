@@ -14,9 +14,64 @@ from getpass import getpass
 from types import SimpleNamespace
 from urllib.parse import urlparse
 from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from http.client import HTTPSConnection
+from urllib.request import Request, urlopen, build_opener, install_opener, HTTPSHandler
 
 """An icinga check_command wrapper to icinga api for submitting passive check results"""
+
+
+class FingerprintedHTTPSConnection(HTTPSConnection):
+    """HTTPSConnection with fingerprint verification instead of full-chain checks"""
+
+    def __init__(self, host, expected_fingerprint, **kwargs):
+        self.expected_fingerprint = expected_fingerprint
+        super().__init__(host, **kwargs)
+
+    def connect(self) -> None:
+        """Implement fingerprint verification instead of default TLS chain verification"""
+
+        # disable complete certificate chain verification, rely on fingerprint instead
+        ctx = ssl._create_unverified_context()
+
+        # create tls connection
+        self.sock = ctx.wrap_socket(
+            socket.create_connection((self.host, self.port)), server_hostname=self.host
+        )
+
+        # calculate fingerprint
+        cert_der = self.sock.getpeercert(binary_form=True)
+        actual_fingerprint = hashlib.sha256(cert_der).hexdigest()
+
+        # compare fingerprints and raise exception
+        if actual_fingerprint != self.expected_fingerprint:
+            raise ssl.SSLError(
+                f"Certificate fingerprint mismatch! "
+                f"Expected: {self.expected_fingerprint}, "
+                f"Got: {actual_fingerprint}"
+                f"Please update your config with the new fingerprint, if applicable."
+            )
+
+
+class FingerprintHttpsHandler(HTTPSHandler):
+    """Custom HTTPSHandler implementation to ensure peer certificate fingerprint matches"""
+
+    def __init__(self, expected_fingerprint, **kwargs):
+        """Accept and save expected fingerprint for later use"""
+
+        super().__init__(**kwargs)
+        self.expected_fingerprint = expected_fingerprint
+
+    def https_open(self, request):
+        """Install hook to fingerprint verifying connection-"""
+
+        return self.do_open(self.fingerprint_verifying_connection, request)
+
+    def fingerprint_verifying_connection(self, host, **kwargs):
+        """Patch in custom HTTPSConnection class with fingerprint verification"""
+
+        return FingerprintedHTTPSConnection(
+            host, expected_fingerprint=self.expected_fingerprint, **kwargs
+        )
 
 
 def verify_url(url):
@@ -59,13 +114,6 @@ def download_certificate(args, url):
     if not yesno:
         raise Exception("Untrusted certificate, unable to continue.")
 
-    # write accepted certificate to file in pem format
-    cert_pem = ssl.DER_cert_to_PEM_cert(cert_der)
-    with open(args.cacert, "w+") as fd:
-        fd.write(cert_pem)
-        fd.flush()
-        fd.close()
-
     return fp
 
 
@@ -74,18 +122,11 @@ def parse_args():
 
     parser = argparse.ArgumentParser(description=__doc__)
     configpath = pathlib.Path(__file__).parent.resolve() / "config.ini"
-    capath = pathlib.Path(__file__).parent.resolve() / "master.pem"
     parser.add_argument(
         "--config",
         type=pathlib.Path,
         default=configpath,
         help="Path where to store/load config from. [default=config.ini]",
-    )
-    parser.add_argument(
-        "--cacert",
-        type=pathlib.Path,
-        default=capath,
-        help="Path where to store/load ca certificate from. [default=master.pem]",
     )
     parser.add_argument(
         "--timeout",
@@ -197,11 +238,10 @@ def execute(args):
         )
 
 
-def deliver(args, config, result) -> bool:
-    """build api request and deliver passive result"""
+def build_request_data(args, result, default) -> dict:
+    """build request data dictionary for icinga api passive result delivery"""
 
     data = {}
-    default = config["DEFAULT"]
 
     # return status for icinga
     data["exit_status"] = result.returncode
@@ -222,11 +262,21 @@ def deliver(args, config, result) -> bool:
     if args.ttl:
         data["ttl"] = args.ttl
 
-    # set filter
+    # finally set required filter
     data["type"] = "Service"
     data["filter"] = (
         f"host.name==\"{default['check_source']}\" && service.name==\"{args.s}\""
     )
+
+    return data
+
+
+def deliver(args, config, result) -> bool:
+    """build api request and deliver passive result"""
+
+    default = config["DEFAULT"]
+    authconfig = config["TLS"]
+    data = build_request_data(args, result, default)
 
     # create encoded credentials
     credentials = f"{default['user']}:{default['password']}"
@@ -239,6 +289,10 @@ def deliver(args, config, result) -> bool:
         "Authorization": f"Basic {encoded_credentials}",
     }
 
+    # build opener for ssl fingerprint verification
+    opener = build_opener(FingerprintHttpsHandler(authconfig["fingerprint"]))
+    install_opener(opener)
+
     # build request
     request = Request(
         default["url"],
@@ -247,12 +301,9 @@ def deliver(args, config, result) -> bool:
         method="post",
     )
 
-    # load acccepted certificate from file and use for verification of the connection
-    ctx = ssl.create_default_context(cafile=args.cacert)
-
     # execute request
     try:
-        response = urlopen(request, context=ctx)
+        response = urlopen(request)
         if 200 <= response.status <= 299:
             return
         raise Exception(
@@ -270,11 +321,6 @@ def deliver(args, config, result) -> bool:
         elif e.status == 404:
             raise Exception(
                 "API endpoint returned 404, this is probably due to your filters not matching (hostname or service name)."
-            )
-    except ssl.SSLError as e:
-        if "certificate verify failed" in str(e):
-            raise Exception(
-                "API endpoint returned an untrusted certificate, please delete the config and re-run the script."
             )
 
 
