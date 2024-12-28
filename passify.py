@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import ssl
+import sys
 import json
 import socket
 import base64
@@ -135,14 +136,14 @@ def parse_args():
         help="Optional timeout for execution in seconds.",
     )
     parser.add_argument(
+        "--ttl", type=int, default=None, help="TTL argument to pass to icinga api"
+    )
+    parser.add_argument(
         "-s",
         type=str,
         required=True,
         metavar="SERVICE NAME",
         help="Specify service name",
-    )
-    parser.add_argument(
-        "--ttl", type=int, default=None, help="TTL argument to pass to icinga api"
     )
     parser.add_argument(
         "check_command",
@@ -217,6 +218,15 @@ def load_config(args):
 def execute(args):
     """Execute specified command as subprocess and enfore timeout if necessary"""
 
+    # report missing check command to monitoring
+    if len(args.check_command) < 1:
+        print("[Warning] No check_command supplied.", file=sys.stderr)
+        return SimpleNamespace(
+            returncode=3,
+            stdout="No check_command supplied.",
+            args=[],
+        )
+
     try:
         # execute check_command
         result = subprocess.run(
@@ -228,13 +238,17 @@ def execute(args):
             return SimpleNamespace(
                 returncode=3,
                 stdout=f"check_command returned with unexpected return code {result.returncode}.",
+                args=[],
             )
 
         return result
 
     except subprocess.TimeoutExpired:
         return SimpleNamespace(
-            returncode=3, stdout="check_command timed out.", stderr=None
+            returncode=3,
+            stdout="check_command timed out.",
+            stderr=None,
+            args=[],
         )
 
 
