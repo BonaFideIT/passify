@@ -7,6 +7,7 @@ import socket
 import base64
 import pathlib
 import os.path
+import hashlib
 import argparse
 import subprocess
 import configparser
@@ -28,12 +29,47 @@ def verify_url(url):
     except Exception as e:
         return None
 
+def download_certificate(args, url):
+    """download tls certificate from https url and display fingerprint for verification"""
+    
+    # download certificate
+    ctx = ssl._create_unverified_context()
+    port = url.port if url.port is not None else 443
+    with socket.create_connection((url.hostname, port)) as sock:
+        with ctx.wrap_socket(sock, server_hostname=url.hostname) as ssock:
+            cert_der = ssock.getpeercert(binary_form=True)
+    
+    # calculate fingerprint
+    fp = hashlib.sha256(cert_der).hexdigest()
+    
+    def format_fingerprint(fingerprint_hex: str) -> str:
+        return ":".join(fingerprint_hex[i:i+2] for i in range(0, len(fingerprint_hex), 2)).upper()
+    
+    # ask for confirmation
+    print("Please verfiy TLS fingerprint with certificate from master:")
+    print(format_fingerprint(fp))
+    print("Hint: openssl x509 -in /var/lib/icinga2/certs/<hostname>.crt -noout -fingerprint -sha256")
+    yesno = input("Accept? [y/N]") == "y" or False
+    if not yesno:
+        raise Exception("Untrusted certificate, unable to continue.")
+    
+    # write accepted certificate to file in pem format
+    cert_pem = ssl.DER_cert_to_PEM_cert(cert_der)
+    with open(args.cacert, "w+") as fd:
+        fd.write(cert_pem)
+        fd.flush()
+        fd.close()
+    
+    return fp
+
 def parse_args():
     """Parse command line arguments, capture known and unknown args"""
     
     parser = argparse.ArgumentParser(description=__doc__)
     configpath = pathlib.Path(__file__).parent.resolve() / "config.ini"
+    capath = pathlib.Path(__file__).parent.resolve() / "master.pem"
     parser.add_argument("--config", type=pathlib.Path, default=configpath, help="Path where to store/load config from. [default=config.ini]")
+    parser.add_argument("--cacert", type=pathlib.Path, default=capath, help="Path where to store/load ca certificate from. [default=master.pem]")
     parser.add_argument("--timeout", type=int, default=None, help="Optional timeout for execution in seconds.")
     parser.add_argument("-s", type=str, required=True, metavar="SERVICE NAME", help="Specify service name")
     parser.add_argument("--ttl", type=int, default=None, help="TTL argument to pass to icinga api")
@@ -44,26 +80,37 @@ def parse_args():
 def load_config(args):
     """Load config from file, init with necessary values"""
     
+    # prep config parser
     config = configparser.ConfigParser()
     default = config["DEFAULT"]
+    if not "TLS" in config:
+        config["TLS"] = {}
+    authconfig = config["TLS"]
     
     # load config from file
     if os.path.isfile(args.config):
         config.read(args.config)
-        if not {"url", "user", "password", "check_source"}.issubset(default):
-            raise Exception("Invalid configuration file.")
+        if not {"url", "user", "password", "check_source"}.issubset(default) or not {"fingerprint"}.issubset(authconfig):
+            raise Exception("Invalid configuration file. Delete config file and try again.")
         
         return config
     
     # request api url until a valid url is provided
     durl = "https://localhost:5665"
-    while not "url" in default or url := verify_url(default["url"]) is None:
-        if url is None:
-            print("[ERROR] Invalid url, please specify a valid url.")
+    url = None
+    while url is None:
+        # ask for url
         default["url"] = input(f"Icinga API master url (default: {durl}):") or durl
         default["url"] += "/v1/actions/process-check-result"
+        
+        # parse and verify url
+        url = verify_url(default["url"])
+        if url is None:
+            print("[ERROR] Invalid url, please specify a valid url.")
     
-    # TODO: Add download certificate and validate connection
+    # download certificate and validate fingerprint
+    if url.scheme == "https":
+        authconfig["fingerprint"] = download_certificate(args, url)
     
     # request check_source property
     hostname = socket.getfqdn()
@@ -148,11 +195,11 @@ def deliver(args, config, result) -> bool:
         default["url"],
         data=bytes(json.dumps(data), encoding="utf-8"),
         headers=headers,
-        method="post"
+        method="post",
     )
     
-    # FIXME: ignore ssl context
-    ctx = ssl._create_unverified_context()
+    # load acccepted certificate from file and use for verification of the connection
+    ctx = ssl.create_default_context(cafile=args.cacert)
     
     # execute request
     try:
@@ -169,6 +216,9 @@ def deliver(args, config, result) -> bool:
                 raise Exception(f"API endpoint returned 500: {res}")
         elif e.status == 404:
             raise Exception("API endpoint returned 404, this is probably due to your filters not matching (hostname or service name).")
+    except ssl.SSLError as e:
+        if "certificate verify failed" in str(e):
+            raise Exception("API endpoint returned an untrusted certificate, please delete the config and re-run the script.")
 
 def main():
     
