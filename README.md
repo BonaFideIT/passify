@@ -21,6 +21,8 @@ Or in path like this:
 
 # installation
 
+`pip install icinga-passify`
+
 * copy passify.py to your server.
 * Install to path for full convenience if you like, call as seen above:
 
